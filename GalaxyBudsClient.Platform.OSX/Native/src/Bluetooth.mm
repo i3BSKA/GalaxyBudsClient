@@ -3,13 +3,34 @@
 // Copyright (c) 2021 Tim Schneeberger. Licensed under GPLv3.
 //
 
+#include <stdlib.h>
+#include <string.h>
+
 #import <IOBluetooth/IOBluetooth.h>
+
 #import "Bluetooth.h"
+#import "NativeStringUtils.h"
+
+static void FreeEnumerationDevices(EnumerationResult *result, int initializedCount) {
+    if (result == NULL || result->devices == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < initializedCount; i++) {
+        free(result->devices[i].mac_address);
+        free(result->devices[i].device_name);
+    }
+
+    free(result->devices);
+    result->devices = NULL;
+    result->length = 0;
+}
 
 @implementation Bluetooth {
     NSString *_macAddress;
     Bt_OnChannelData _onChannelData;
     Bt_OnChannelClosed _onChannelClosed;
+    BOOL _channelClosedSignalled;
 }
 
 - (id)init {
@@ -74,7 +95,7 @@
     IOBluetoothSDPServiceRecord *serviceRecord = [device getServiceRecordForUUID:parsedUuid];
 
     if (serviceRecord == nil) {
-        NSLog(@"Error - service in selected device. ***This should never happen.***\n", NULL);
+        NSLog(@"Error - service in selected device. ***This should never happen.***");
         return BT_CONN_ESDP;
     }
 
@@ -93,8 +114,11 @@
     // Open the RFCOMM channel on the new device connection
     IOBluetoothRFCOMMChannel *tempRFCOMMChannel = mRFCOMMChannel;
     status = [device openRFCOMMChannelSync:&tempRFCOMMChannel withChannelID:rfcommChannelID delegate:self];
-    mRFCOMMChannel = tempRFCOMMChannel;
-    
+    @synchronized (self) {
+        mRFCOMMChannel = tempRFCOMMChannel;
+        _channelClosedSignalled = NO;
+    }
+
     if (mRFCOMMChannel == nil) {
         NSLog(@"Error: %s - unable to open RFCOMM channel.\n", mach_error_string(status) );
         [self disconnect];
@@ -136,18 +160,40 @@
 
 - (BOOL)disconnect
 {
-    if (mRFCOMMChannel != nil) {
-        // This will close the RFCOMM channel and start an inactivity timer to close the baseband connection if no
-        // other channels (L2CAP or RFCOMM) are open.
-        [mRFCOMMChannel setDelegate:nil];
-        [mRFCOMMChannel closeChannel];
-        
+    // mRFCOMMChannel is also read by sendData on another thread; swap it out
+    // under the lock so in-flight sends keep a valid (closed) channel object.
+    IOBluetoothRFCOMMChannel *channel;
+    @synchronized (self) {
+        channel = mRFCOMMChannel;
         mRFCOMMChannel = nil;
     }
-    
+
+    if (channel != nil) {
+        // This will close the RFCOMM channel and start an inactivity timer to close the baseband connection if no
+        // other channels (L2CAP or RFCOMM) are open.
+        [channel setDelegate:nil];
+        [channel closeChannel];
+    }
+
     _macAddress = NULL;
 
     return TRUE;
+}
+
+// A remote close (rfcommChannelClosed:) can race an in-flight send hitting the closed
+// channel, and both paths would otherwise fire _onChannelClosed -> a duplicate managed
+// Disconnected event. Signal at most once per connection; reset on the next connect.
+- (void)signalChannelClosedOnce {
+    @synchronized (self) {
+        if (_channelClosedSignalled) {
+            return;
+        }
+        _channelClosedSignalled = YES;
+    }
+
+    if (_onChannelClosed) {
+        _onChannelClosed();
+    }
 }
 
 - (BOOL)isConnected {
@@ -155,36 +201,81 @@
 }
 
 - (BT_ENUM_RESULT)enumerate:(EnumerationResult *)result {
+    if (result == NULL) {
+        NSLog(@"Error - failed to enumerate - result pointer is null!");
+        return BT_ENUM_EUNKNOWN;
+    }
+
+    result->length = 0;
+    result->devices = NULL;
+
     NSArray *inDevices = [IOBluetoothDevice pairedDevices];
 
-    result->length = (int)(unsigned long)[inDevices count];
-    result->devices = (Device*)malloc(sizeof(Device) * result->length);
+    int deviceCount = (int)(unsigned long)[inDevices count];
+    if (deviceCount == 0) {
+        return BT_ENUM_SUCCESS;
+    }
+
+    result->devices = (Device*)calloc((size_t)deviceCount, sizeof(Device));
     if (!result->devices) {
         NSLog(@"Error - failed to enumerate - out of memory!");
         return BT_ENUM_EUNKNOWN;
     }
 
-    for (int i = 0; i < result->length; i++) {
-        Device *resultDevice = &result->devices[i];
+    int validCount = 0;
+    for (int i = 0; i < deviceCount; i++) {
         IOBluetoothDevice *device = [inDevices objectAtIndex:i];
-        resultDevice->device_name = (char *)malloc([device.name lengthOfBytesUsingEncoding:NSUTF8StringEncoding]+1);
-        resultDevice->mac_address = (char *)malloc([device.addressString lengthOfBytesUsingEncoding:NSUTF8StringEncoding]+1);
-        strcpy(resultDevice->device_name, device.name.UTF8String);
-        strcpy(resultDevice->mac_address, device.addressString.UTF8String);
+        NSString *addressString = [device addressString];
+        if (IsNullOrEmpty(addressString)) {
+            NSLog(@"Bluetooth::enumerate(): Skipping paired device with missing address: %@", device);
+            continue;
+        }
+
+        Device *resultDevice = &result->devices[validCount];
+        NSString *nameString = FirstNonEmptyString([device name], [device nameOrAddress], addressString);
+
+        resultDevice->device_name = CopyNSStringToUtf8CString(nameString);
+        resultDevice->mac_address = CopyNSStringToUtf8CString(addressString);
+        if (resultDevice->device_name == NULL || resultDevice->mac_address == NULL) {
+            NSLog(@"Error - failed to enumerate - unable to copy device strings!");
+            FreeEnumerationDevices(result, validCount + 1);
+            return BT_ENUM_EUNKNOWN;
+        }
+
         resultDevice->is_connected = device.isConnected;
         resultDevice->is_paired = device.isPaired;
         resultDevice->cod = device.classOfDevice;
+        validCount++;
     }
 
+    result->length = validCount;
     return BT_ENUM_SUCCESS;
 }
 
 - (BT_SEND_RESULT)sendData:(char *)buffer length:(UInt32)length
 {
-    if (mRFCOMMChannel != nil) {
-        if (![mRFCOMMChannel isOpen]) {
-            [self disconnect];
-            _onChannelClosed();
+    // Snapshot the channel: the IOBluetooth callback thread can run disconnect
+    // (nilling mRFCOMMChannel) while this loop is mid-write. The local strong
+    // reference keeps the object alive; writeSync on a closed channel just
+    // returns an error and ends the loop.
+    IOBluetoothRFCOMMChannel *channel;
+    @synchronized (self) {
+        channel = mRFCOMMChannel;
+    }
+
+    if (channel != nil) {
+        if (![channel isOpen]) {
+            // Only tear down if this snapshot is still the current channel; a concurrent
+            // disconnect/reconnect may have already replaced it, and disconnecting here
+            // would kill the fresh connection or re-report an intentional teardown.
+            BOOL isCurrent;
+            @synchronized (self) {
+                isCurrent = (channel == mRFCOMMChannel);
+            }
+            if (isCurrent) {
+                [self disconnect];
+                [self signalChannelClosedOnce];
+            }
             return BT_SEND_ENULL;
         }
         UInt32 numBytesRemaining;
@@ -196,16 +287,21 @@
 
         // Get the RFCOMM Channel's MTU.  Each write can only contain up to the MTU size
         // number of bytes.
-        rfcommChannelMTU = [mRFCOMMChannel getMTU];
+        rfcommChannelMTU = [channel getMTU];
 
         // Loop through the data until we have no more to send.
         while ( (result == kIOReturnSuccess) && (numBytesRemaining > 0) ) {
+            if (![channel isOpen]) {
+                result = kIOReturnNotOpen;
+                break;
+            }
+
             // finds how many bytes I can send:
             UInt32 numBytesToSend = ( (numBytesRemaining > rfcommChannelMTU) ? rfcommChannelMTU : numBytesRemaining);
 
             // This method won't return until the buffer has been passed to the Bluetooth hardware to be sent to the remote device.
             // Alternatively, the asynchronous version of this method could be used which would queue up the buffer and return immediately.
-            result = [mRFCOMMChannel writeSync:buffer length:static_cast<UInt16>(numBytesToSend)];
+            result = [channel writeSync:buffer length:static_cast<UInt16>(numBytesToSend)];
 
             // Updates the position in the buffer:
             numBytesRemaining -= numBytesToSend;
@@ -254,9 +350,7 @@
 
 - (void)rfcommChannelClosed:(IOBluetoothRFCOMMChannel *)rfcommChannel {
     [self disconnect];
-    if (_onChannelClosed) {
-        _onChannelClosed();
-    }
+    [self signalChannelClosedOnce];
 }
 
 @end
